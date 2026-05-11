@@ -1,0 +1,50 @@
+general:
+  seed: 42
+
+wandb:
+  api_key: null
+  project: "AFRNet-Recognition"
+
+data:
+  split_path: "data/recog_splits.json"
+  n_genuine_impressions: 32
+  n_impostor_impressions: 1
+  impostor_mode: "all"
+  n_impostor_subset: null
+  gallery_per_id: 1
+  probe_per_id: null
+  transform_name: "dual"
+
+training:
+  epochs: 75
+  recog_batch_size: 256
+  num_workers: 8
+  pin_memory: true
+  checkpoint_interval: 20
+
+model:
+  model_name: "afrnet"
+  pretrained: true
+  ckpt_path: null
+
+loss:
+  margin: 0.5
+  scale: 32.0
+
+optimizer:
+  opt_name: "adam"
+  lr: 1.0e-4
+  weight_decay: 2.0e-5
+
+scheduler:
+  sched_name: "polynomial"
+  power: 3.0
+  min_lr: 1.0e-5
+  warmup_epochs: 0
+
+output:
+  checkpoint_dir: "ckpts/"
+  best_model_name: "best_model.pth"
+
+evaluation:
+  recog_batch_size: 1024
