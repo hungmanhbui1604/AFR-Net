@@ -1,5 +1,6 @@
 __pycache__/
 ckpts/
 data/
+results/
 wandb/
 config.yaml

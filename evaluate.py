@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 
 import numpy as np
@@ -218,7 +219,7 @@ def evaluate_identification(
     return sim_mat, probe_labels, gallery_labels
 
 
-def main(cfg: dict, checkpoint: str, split_path: str) -> None:
+def main(cfg: dict, checkpoint: str, split_path: str, output_dir: str) -> None:
     data_cfg = cfg["data"]
     model_cfg = cfg["model"]
     eval_cfg = cfg["evaluation"]
@@ -310,6 +311,7 @@ def main(cfg: dict, checkpoint: str, split_path: str) -> None:
     print("Authentication Metrics:")
     print("-" * 60)
     print(f"Test EER: {auth_metrics['eer']:.2%}  (thr={auth_metrics['eer_threshold']:.4f})")
+    print(f"Test AUC: {auth_metrics['auc']:.2%}")
     print(f"Test TAR@FAR=0.1: {auth_metrics['tar_at_far_0.1']:.2%}")
     print(f"Test TAR@FAR=0.01: {auth_metrics['tar_at_far_0.01']:.2%}")
     print(f"Test TAR@FAR=0.001: {auth_metrics['tar_at_far_0.001']:.2%}")
@@ -323,6 +325,36 @@ def main(cfg: dict, checkpoint: str, split_path: str) -> None:
     print(f"Rank-5 Accuracy : {id_metrics['rank_5']:.2%}")
     print(f"Rank-10 Accuracy: {id_metrics['rank_10']:.2%}")
     print("=" * 60)
+
+    # ── Save results to JSON ──────────────────────────────────────────────────
+    os.makedirs(output_dir, exist_ok=True)
+    summary = {
+        "split_path": split_path,
+        "authentication": {
+            "n_pairs": len(test_dataset),
+            "n_genuine": test_dataset.n_genuine,
+            "n_impostor": test_dataset.n_impostor,
+            "eer": float(auth_metrics["eer"]),
+            "eer_threshold": float(auth_metrics["eer_threshold"]),
+            "auc": float(auth_metrics["auc"]),
+            "tar_at_far_0.1": float(auth_metrics["tar_at_far_0.1"]),
+            "tar_at_far_0.01": float(auth_metrics["tar_at_far_0.01"]),
+            "tar_at_far_0.001": float(auth_metrics["tar_at_far_0.001"]),
+        },
+        "identification": {
+            "n_ids": identification_dataset.n_ids,
+            "n_gallery": identification_dataset.n_gallery,
+            "n_probes": identification_dataset.n_probes,
+            "rank_1": float(id_metrics["rank_1"]),
+            "rank_5": float(id_metrics["rank_5"]),
+            "rank_10": float(id_metrics["rank_10"]),
+        },
+    }
+
+    json_path = os.path.join(output_dir, "test_metrics.json")
+    with open(json_path, "w") as f:
+        json.dump(summary, f, indent=2)
+    print(f"\nResults saved → {json_path}")
 
 
 if __name__ == "__main__":
@@ -345,7 +377,13 @@ if __name__ == "__main__":
         required=True,
         help="Path to checkpoint to evaluate",
     )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default="results/",
+        help="Directory for metrics JSON",
+    )
     args = parser.parse_args()
 
     cfg = load_config(args.config)
-    main(cfg, checkpoint=args.checkpoint_path, split_path=args.split_path)
+    main(cfg, checkpoint=args.checkpoint_path, split_path=args.split_path, output_dir=args.output_dir)
