@@ -89,7 +89,7 @@ def get_embeddings(
     val_unique_loader: DataLoader,
     device: torch.device,
     epoch: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     model.eval()
 
     embed_dim_c = _unwrap(model).zc_linear.out_features
@@ -98,7 +98,6 @@ def get_embeddings(
 
     local_embeddings_c = torch.zeros((n_unique_images, embed_dim_c), device=device)
     local_embeddings_a = torch.zeros((n_unique_images, embed_dim_a), device=device)
-    local_embeddings_l = None
     mask = torch.zeros(n_unique_images, device=device, dtype=torch.bool)
 
     pbar = tqdm(
@@ -112,18 +111,13 @@ def get_embeddings(
     for idxs, imgs in pbar:
         imgs = imgs.to(device, non_blocking=True)
         with torch.autocast(device_type="cuda"):
-            zc, za, local_features = model(imgs)
+            zc, za, _ = model(imgs)
         
         zc = F.normalize(zc, dim=1).float()
         za = F.normalize(za, dim=1).float()
 
-        if local_embeddings_l is None:
-            _, C, H, W = local_features.shape
-            local_embeddings_l = torch.zeros((n_unique_images, C, H, W), device=device, dtype=torch.float16)
-
         local_embeddings_c[idxs] = zc
         local_embeddings_a[idxs] = za
-        local_embeddings_l[idxs] = local_features.to(dtype=torch.float16)
         mask[idxs] = True
 
     counts = torch.zeros(n_unique_images, device=device)
@@ -132,18 +126,12 @@ def get_embeddings(
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(local_embeddings_c, op=dist.ReduceOp.SUM)
         dist.all_reduce(local_embeddings_a, op=dist.ReduceOp.SUM)
-        if local_embeddings_l is not None:
-            dist.all_reduce(local_embeddings_l, op=dist.ReduceOp.SUM)
         dist.all_reduce(counts, op=dist.ReduceOp.SUM)
 
     global_embeddings_c = local_embeddings_c / counts.clamp_min(1.0).unsqueeze(1)
     global_embeddings_a = local_embeddings_a / counts.clamp_min(1.0).unsqueeze(1)
-    if local_embeddings_l is not None:
-        global_embeddings_l = local_embeddings_l / counts.clamp_min(1.0).view(-1, 1, 1, 1)
-    else:
-        global_embeddings_l = None
         
-    return global_embeddings_c, global_embeddings_a, global_embeddings_l
+    return global_embeddings_c, global_embeddings_a
 
 
 @torch.no_grad()
@@ -153,7 +141,6 @@ def evaluate(
     unique_dataset: UniqueFingerprintDataset,
     global_embeddings_c: torch.Tensor,
     global_embeddings_a: torch.Tensor,
-    global_embeddings_l: torch.Tensor,
     device: torch.device,
     epoch: int,
 ) -> tuple[float, float]:
@@ -196,8 +183,12 @@ def evaluate(
                 I1 = unique_dataset[idx1][1].unsqueeze(0).to(device)
                 I2 = unique_dataset[idx2][1].unsqueeze(0).to(device)
                 
-                L1 = global_embeddings_l[idx1].unsqueeze(0).to(device, dtype=torch.float32)
-                L2 = global_embeddings_l[idx2].unsqueeze(0).to(device, dtype=torch.float32)
+                with torch.autocast(device_type="cuda" if torch.cuda.is_available() else "cpu"):
+                    _, _, L1 = model(I1)
+                    _, _, L2 = model(I2)
+                
+                L1 = L1.to(dtype=torch.float32)
+                L2 = L2.to(dtype=torch.float32)
                 
                 s_prime = refinement.apply_refinement(model, I1, I2, L1, L2, device)
                 if s_prime is not None:
@@ -594,12 +585,12 @@ def main(cfg: dict, no_wandb: bool = False, checkpoint: str = None) -> None:
         if dist.is_available() and dist.is_initialized():
             dist.barrier()
 
-        global_embeddings_c, global_embeddings_a, global_embeddings_l = get_embeddings(
+        global_embeddings_c, global_embeddings_a = get_embeddings(
             _unwrap(model), unique_val_loader, device, epoch
         )
 
         if is_main():
-            metrics = evaluate(model, val_loader, unique_val_dataset, global_embeddings_c, global_embeddings_a, global_embeddings_l, device, epoch)
+            metrics = evaluate(model, val_loader, unique_val_dataset, global_embeddings_c, global_embeddings_a, device, epoch)
 
             epoch_pbar.set_postfix(
                 loss=f"{avg_loss:.4f}",
