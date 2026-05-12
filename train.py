@@ -501,7 +501,6 @@ def main(cfg: dict, no_wandb: bool = False, checkpoint: str = None) -> None:
             model,
             device_ids=[local_rank],
             output_device=local_rank,
-            find_unused_parameters=True,
         )
 
     if is_main():
