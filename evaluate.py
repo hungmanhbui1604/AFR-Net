@@ -25,7 +25,7 @@ def get_embeddings(
     model: torch.nn.Module,
     unique_loader: DataLoader,
     device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     model.eval()
 
     embed_dim_c = model.zc_linear.out_features
@@ -34,6 +34,7 @@ def get_embeddings(
 
     global_embeddings_c = torch.zeros((n_unique_images, embed_dim_c), device=device)
     global_embeddings_a = torch.zeros((n_unique_images, embed_dim_a), device=device)
+    global_features = None
 
     pbar = tqdm(
         unique_loader,
@@ -45,15 +46,19 @@ def get_embeddings(
     for idxs, imgs in pbar:
         imgs = imgs.to(device, non_blocking=True)
         with torch.autocast(device_type="cuda" if torch.cuda.is_available() else "cpu"):
-            zc, za, _ = model(imgs)
+            zc, za, l_feats = model(imgs)
+            
+        if global_features is None:
+            global_features = torch.zeros((n_unique_images, *l_feats.shape[1:]), device=device, dtype=torch.float32)
         
         zc = F.normalize(zc, dim=1).float()
         za = F.normalize(za, dim=1).float()
 
         global_embeddings_c[idxs] = zc
         global_embeddings_a[idxs] = za
+        global_features[idxs] = l_feats.float()
 
-    return global_embeddings_c, global_embeddings_a
+    return global_embeddings_c, global_embeddings_a, global_features
 
 
 @torch.no_grad()
@@ -63,6 +68,7 @@ def evaluate(
     unique_dataset: UniqueFingerprintDataset,
     global_embeddings_c: torch.Tensor,
     global_embeddings_a: torch.Tensor,
+    global_features: torch.Tensor,
     device: torch.device,
 ) -> tuple[float, float]:
     import refinement
@@ -103,12 +109,8 @@ def evaluate(
                 I1 = unique_dataset[idx1][1].unsqueeze(0).to(device)
                 I2 = unique_dataset[idx2][1].unsqueeze(0).to(device)
                 
-                with torch.autocast(device_type="cuda" if torch.cuda.is_available() else "cpu"):
-                    _, _, L1 = model(I1)
-                    _, _, L2 = model(I2)
-                
-                L1 = L1.to(dtype=torch.float32)
-                L2 = L2.to(dtype=torch.float32)
+                L1 = global_features[idx1]
+                L2 = global_features[idx2]
                 
                 s_prime = refinement.apply_refinement(model, I1, I2, L1, L2, device)
                 if s_prime is not None:
@@ -135,6 +137,7 @@ def evaluate_identification(
 
     all_embs_c = []
     all_embs_a = []
+    all_l_feats = []
     all_labels = []
     all_indices = []
 
@@ -149,33 +152,39 @@ def evaluate_identification(
         for imgs, labels, idx in pbar:
             imgs = imgs.to(device, non_blocking=True)
             with torch.autocast(device_type="cuda" if torch.cuda.is_available() else "cpu"):
-                zc, za, _ = model(imgs)
+                zc, za, l_feats = model(imgs)
 
             zc = F.normalize(zc, dim=1).cpu()
             za = F.normalize(za, dim=1).cpu()
+            l_feats = l_feats.cpu().float()
 
             all_embs_c.append(zc)
             all_embs_a.append(za)
+            all_l_feats.append(l_feats)
             all_labels.extend(labels.numpy())
             all_indices.extend(idx.numpy())
 
     all_embs_c = torch.cat(all_embs_c, dim=0).numpy()
     all_embs_a = torch.cat(all_embs_a, dim=0).numpy()
+    all_l_feats = torch.cat(all_l_feats, dim=0).to(device)
     all_labels = np.array(all_labels)
     all_indices = np.array(all_indices)
 
     sort_order = np.argsort(all_indices)
     all_embs_c = all_embs_c[sort_order]
     all_embs_a = all_embs_a[sort_order]
+    all_l_feats = all_l_feats[sort_order]
     all_labels = all_labels[sort_order]
 
     n_gal = dataset.n_gallery
     gallery_embs_c = all_embs_c[:n_gal]
     gallery_embs_a = all_embs_a[:n_gal]
+    gallery_l_feats = all_l_feats[:n_gal]
     gallery_labels = all_labels[:n_gal]
 
     probe_embs_c = all_embs_c[n_gal:]
     probe_embs_a = all_embs_a[n_gal:]
+    probe_l_feats = all_l_feats[n_gal:]
     probe_labels = all_labels[n_gal:]
 
     sim_mat_c = np.dot(probe_embs_c, gallery_embs_c.T)
@@ -199,12 +208,8 @@ def evaluate_identification(
                 I1 = dataset[idx_probe][0].unsqueeze(0).to(device)
                 I2 = dataset[idx_gallery][0].unsqueeze(0).to(device)
                 
-                with torch.autocast(device_type="cuda" if torch.cuda.is_available() else "cpu"):
-                    _, _, L1 = model(I1)
-                    _, _, L2 = model(I2)
-                    
-                L1 = L1.to(dtype=torch.float32)
-                L2 = L2.to(dtype=torch.float32)
+                L1 = probe_l_feats[i]
+                L2 = gallery_l_feats[j]
                 
                 s_prime = refinement.apply_refinement(model, I1, I2, L1, L2, device)
                 if s_prime is not None:
@@ -290,11 +295,11 @@ def main(cfg: dict, checkpoint: str, split_path: str, output_dir: str) -> None:
     model.eval()
 
     # ── Evaluation loop ───────────────────────────────────────────────────
-    global_embeddings_c, global_embeddings_a = get_embeddings(
+    global_embeddings_c, global_embeddings_a, global_features = get_embeddings(
         model, unique_test_loader, device
     )
 
-    auth_metrics = evaluate(model, test_loader, unique_test_dataset, global_embeddings_c, global_embeddings_a, device)
+    auth_metrics = evaluate(model, test_loader, unique_test_dataset, global_embeddings_c, global_embeddings_a, global_features, device)
     
     sim_mat, probe_labels, gallery_labels = evaluate_identification(
         model, identification_loader, device, identification_dataset

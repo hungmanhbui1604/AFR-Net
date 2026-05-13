@@ -59,7 +59,7 @@ def crop_overlap(I1_prime, I2):
     # A simple proxy is summing over channels and checking for > 0
     # Note: image might have 0 pixels naturally, so it's an approximation
     # A more robust way is to just assume I2 is full size, and I1_prime has a valid boundary
-    valid_mask = (I1_prime.abs().sum(dim=0) > 1e-4).float().numpy()
+    valid_mask = (I1_prime.abs().sum(dim=0) > 1e-4).float().cpu().numpy()
     
     # If the mask is completely empty or almost empty, fallback
     if valid_mask.sum() < 400: # less than 20x20 area
