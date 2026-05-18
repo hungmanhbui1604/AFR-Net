@@ -98,7 +98,6 @@ def get_embeddings(
 
     local_embeddings_c = torch.zeros((n_unique_images, embed_dim_c), device=device)
     local_embeddings_a = torch.zeros((n_unique_images, embed_dim_a), device=device)
-    local_features = None
     mask = torch.zeros(n_unique_images, device=device, dtype=torch.bool)
 
     pbar = tqdm(
@@ -112,17 +111,13 @@ def get_embeddings(
     for idxs, imgs in pbar:
         imgs = imgs.to(device, non_blocking=True)
         with torch.autocast(device_type="cuda"):
-            zc, za, l_feats = model(imgs)
+            zc, za, _ = model(imgs)
             
-        if local_features is None:
-            local_features = torch.zeros((n_unique_images, *l_feats.shape[1:]), device=device, dtype=torch.float32)
-        
         zc = F.normalize(zc, dim=1).float()
         za = F.normalize(za, dim=1).float()
 
         local_embeddings_c[idxs] = zc
         local_embeddings_a[idxs] = za
-        local_features[idxs] = l_feats.float()
         mask[idxs] = True
 
     counts = torch.zeros(n_unique_images, device=device)
@@ -131,14 +126,12 @@ def get_embeddings(
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(local_embeddings_c, op=dist.ReduceOp.SUM)
         dist.all_reduce(local_embeddings_a, op=dist.ReduceOp.SUM)
-        dist.all_reduce(local_features, op=dist.ReduceOp.SUM)
         dist.all_reduce(counts, op=dist.ReduceOp.SUM)
 
     global_embeddings_c = local_embeddings_c / counts.clamp_min(1.0).unsqueeze(1)
     global_embeddings_a = local_embeddings_a / counts.clamp_min(1.0).unsqueeze(1)
-    global_features = local_features / counts.clamp_min(1.0).view(-1, 1, 1, 1)
         
-    return global_embeddings_c, global_embeddings_a, global_features
+    return global_embeddings_c, global_embeddings_a
 
 
 @torch.no_grad()
@@ -148,11 +141,9 @@ def evaluate(
     unique_dataset: UniqueFingerprintDataset,
     global_embeddings_c: torch.Tensor,
     global_embeddings_a: torch.Tensor,
-    global_features: torch.Tensor,
     device: torch.device,
     epoch: int,
 ) -> tuple[float, float]:
-    import refinement
     all_scores, all_labels = [], []
 
     pbar = tqdm(
@@ -163,7 +154,7 @@ def evaluate(
         disable=not is_main(),
     )
 
-    w1, w2 = 0.5, 0.5 # Fusion weights for CNN and Attention embeddings
+    w1, w2 = 0.5, 0.5
 
     for idx_a, idx_b, labels in pbar:
         idx_a = idx_a.to(device, non_blocking=True)
@@ -177,26 +168,7 @@ def evaluate(
 
         cos_sim_c = (emb_c_a * emb_c_b).sum(dim=1)
         cos_sim_a = (emb_a_a * emb_a_b).sum(dim=1)
-        
         cos_sim = w1 * cos_sim_c + w2 * cos_sim_a
-        
-        # Test-time refinement (Algorithm 1)
-        # sl, sh = 0.3, 0.6
-        # w3, w4 = 0.5, 0.5
-        # for i in range(len(cos_sim)):
-        #     s = cos_sim[i].item()
-        #     if sl <= s <= sh:
-        #         idx1 = idx_a[i].item()
-        #         idx2 = idx_b[i].item()
-        #         I1 = unique_dataset[idx1][1].unsqueeze(0).to(device)
-        #         I2 = unique_dataset[idx2][1].unsqueeze(0).to(device)
-                
-        #         L1 = global_features[idx1]
-        #         L2 = global_features[idx2]
-                
-        #         s_prime = refinement.apply_refinement(model, I1, I2, L1, L2, device)
-        #         if s_prime is not None:
-        #             cos_sim[i] = w3 * s + w4 * s_prime
 
         all_scores.append(cos_sim.cpu().numpy())
         all_labels.append(labels.numpy())
@@ -228,7 +200,7 @@ def load_checkpoint(
     if os.path.isfile(path):
         if is_main():
             print(f"=> Loading checkpoint '{path}'")
-        ckpt_dict = torch.load(path, map_location="cpu")
+        ckpt_dict = torch.load(path, map_location="cpu", weights_only=False)
         _unwrap(model).load_state_dict(ckpt_dict["model"])
         _unwrap(arcface_loss_c).load_state_dict(ckpt_dict["arcface_c"])
         _unwrap(arcface_loss_a).load_state_dict(ckpt_dict["arcface_a"])
@@ -496,7 +468,7 @@ def main(cfg: dict, no_wandb: bool = False, checkpoint: str = None) -> None:
     
     if model_cfg.get("ckpt_path"):
         model.load_state_dict(
-            torch.load(model_cfg["ckpt_path"], map_location="cpu")["model"]
+            torch.load(model_cfg["ckpt_path"], map_location="cpu", weights_only=False)["model"]
         )
         tqdm.write(f"  [model] loaded from {model_cfg['ckpt_path']}")
         
@@ -588,12 +560,12 @@ def main(cfg: dict, no_wandb: bool = False, checkpoint: str = None) -> None:
         if dist.is_available() and dist.is_initialized():
             dist.barrier()
 
-        global_embeddings_c, global_embeddings_a, global_features = get_embeddings(
+        global_embeddings_c, global_embeddings_a = get_embeddings(
             _unwrap(model), unique_val_loader, device, epoch
         )
 
         if is_main():
-            metrics = evaluate(model, val_loader, unique_val_dataset, global_embeddings_c, global_embeddings_a, global_features, device, epoch)
+            metrics = evaluate(model, val_loader, unique_val_dataset, global_embeddings_c, global_embeddings_a, device, epoch)
 
             epoch_pbar.set_postfix(
                 loss=f"{avg_loss:.4f}",

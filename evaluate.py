@@ -34,7 +34,6 @@ def get_embeddings(
 
     global_embeddings_c = torch.zeros((n_unique_images, embed_dim_c), device=device)
     global_embeddings_a = torch.zeros((n_unique_images, embed_dim_a), device=device)
-    global_features = None
 
     pbar = tqdm(
         unique_loader,
@@ -46,19 +45,15 @@ def get_embeddings(
     for idxs, imgs in pbar:
         imgs = imgs.to(device, non_blocking=True)
         with torch.autocast(device_type="cuda" if torch.cuda.is_available() else "cpu"):
-            zc, za, l_feats = model(imgs)
-            
-        if global_features is None:
-            global_features = torch.zeros((n_unique_images, *l_feats.shape[1:]), device=device, dtype=torch.float32)
+            zc, za, _ = model(imgs)
         
         zc = F.normalize(zc, dim=1).float()
         za = F.normalize(za, dim=1).float()
 
         global_embeddings_c[idxs] = zc
         global_embeddings_a[idxs] = za
-        global_features[idxs] = l_feats.float()
 
-    return global_embeddings_c, global_embeddings_a, global_features
+    return global_embeddings_c, global_embeddings_a
 
 
 @torch.no_grad()
@@ -68,10 +63,8 @@ def evaluate(
     unique_dataset: UniqueFingerprintDataset,
     global_embeddings_c: torch.Tensor,
     global_embeddings_a: torch.Tensor,
-    global_features: torch.Tensor,
     device: torch.device,
 ) -> tuple[float, float]:
-    import refinement
     all_scores, all_labels = [], []
 
     pbar = tqdm(
@@ -81,7 +74,7 @@ def evaluate(
         unit="batch",
     )
 
-    w1, w2 = 0.5, 0.5 # Fusion weights for CNN and Attention embeddings
+    w1, w2 = 0.5, 0.5
 
     for idx_a, idx_b, labels in pbar:
         idx_a = idx_a.to(device, non_blocking=True)
@@ -95,26 +88,7 @@ def evaluate(
 
         cos_sim_c = (emb_c_a * emb_c_b).sum(dim=1)
         cos_sim_a = (emb_a_a * emb_a_b).sum(dim=1)
-        
         cos_sim = w1 * cos_sim_c + w2 * cos_sim_a
-        
-        # Test-time refinement (Algorithm 1)
-        sl, sh = 0.3, 0.6
-        w3, w4 = 0.5, 0.5
-        for i in range(len(cos_sim)):
-            s = cos_sim[i].item()
-            if sl <= s <= sh:
-                idx1 = idx_a[i].item()
-                idx2 = idx_b[i].item()
-                I1 = unique_dataset[idx1][1].unsqueeze(0).to(device)
-                I2 = unique_dataset[idx2][1].unsqueeze(0).to(device)
-                
-                L1 = global_features[idx1]
-                L2 = global_features[idx2]
-                
-                s_prime = refinement.apply_refinement(model, I1, I2, L1, L2, device)
-                if s_prime is not None:
-                    cos_sim[i] = w3 * s + w4 * s_prime
 
         all_scores.append(cos_sim.cpu().numpy())
         all_labels.append(labels.numpy())
@@ -137,7 +111,6 @@ def evaluate_identification(
 
     all_embs_c = []
     all_embs_a = []
-    all_l_feats = []
     all_labels = []
     all_indices = []
 
@@ -160,31 +133,26 @@ def evaluate_identification(
 
             all_embs_c.append(zc)
             all_embs_a.append(za)
-            all_l_feats.append(l_feats)
             all_labels.extend(labels.numpy())
             all_indices.extend(idx.numpy())
 
     all_embs_c = torch.cat(all_embs_c, dim=0).numpy()
     all_embs_a = torch.cat(all_embs_a, dim=0).numpy()
-    all_l_feats = torch.cat(all_l_feats, dim=0).to(device)
     all_labels = np.array(all_labels)
     all_indices = np.array(all_indices)
 
     sort_order = np.argsort(all_indices)
     all_embs_c = all_embs_c[sort_order]
     all_embs_a = all_embs_a[sort_order]
-    all_l_feats = all_l_feats[sort_order]
     all_labels = all_labels[sort_order]
 
     n_gal = dataset.n_gallery
     gallery_embs_c = all_embs_c[:n_gal]
     gallery_embs_a = all_embs_a[:n_gal]
-    gallery_l_feats = all_l_feats[:n_gal]
     gallery_labels = all_labels[:n_gal]
 
     probe_embs_c = all_embs_c[n_gal:]
     probe_embs_a = all_embs_a[n_gal:]
-    probe_l_feats = all_l_feats[n_gal:]
     probe_labels = all_labels[n_gal:]
 
     sim_mat_c = np.dot(probe_embs_c, gallery_embs_c.T)
@@ -193,28 +161,6 @@ def evaluate_identification(
     w1, w2 = 0.5, 0.5
     sim_mat = w1 * sim_mat_c + w2 * sim_mat_a
 
-    # Test-time refinement (Algorithm 1)
-    import refinement
-    sl, sh = 0.3, 0.6
-    w3, w4 = 0.5, 0.5
-    
-    for i in tqdm(range(dataset.n_probes), desc="[identification refinement]", leave=False):
-        for j in range(dataset.n_gallery):
-            s = sim_mat[i, j]
-            if sl <= s <= sh:
-                idx_probe = n_gal + i
-                idx_gallery = j
-                
-                I1 = dataset[idx_probe][0].unsqueeze(0).to(device)
-                I2 = dataset[idx_gallery][0].unsqueeze(0).to(device)
-                
-                L1 = probe_l_feats[i]
-                L2 = gallery_l_feats[j]
-                
-                s_prime = refinement.apply_refinement(model, I1, I2, L1, L2, device)
-                if s_prime is not None:
-                    sim_mat[i, j] = w3 * s + w4 * s_prime
-
     return sim_mat, probe_labels, gallery_labels
 
 
@@ -222,6 +168,7 @@ def main(cfg: dict, checkpoint: str, split_path: str, output_dir: str) -> None:
     data_cfg = cfg["data"]
     model_cfg = cfg["model"]
     eval_cfg = cfg["evaluation"]
+    train_cfg = cfg["training"]
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
@@ -259,24 +206,24 @@ def main(cfg: dict, checkpoint: str, split_path: str, output_dir: str) -> None:
         test_dataset,
         batch_size=eval_cfg["recog_batch_size"],
         shuffle=False,
-        num_workers=cfg["training"]["num_workers"],
-        pin_memory=cfg["training"]["pin_memory"],
+        num_workers=train_cfg["num_workers"],
+        pin_memory=train_cfg["pin_memory"],
     )
 
     unique_test_loader = DataLoader(
         unique_test_dataset,
-        batch_size=cfg["training"]["recog_batch_size"],
+        batch_size=train_cfg["recog_batch_size"],
         shuffle=False,
-        num_workers=cfg["training"]["num_workers"],
-        pin_memory=cfg["training"]["pin_memory"],
+        num_workers=train_cfg["num_workers"],
+        pin_memory=train_cfg["pin_memory"],
     )
 
     identification_loader = DataLoader(
         identification_dataset,
-        batch_size=cfg["training"]["recog_batch_size"],
+        batch_size=train_cfg["recog_batch_size"],
         shuffle=False,
-        num_workers=cfg["training"]["num_workers"],
-        pin_memory=cfg["training"]["pin_memory"],
+        num_workers=train_cfg["num_workers"],
+        pin_memory=train_cfg["pin_memory"],
     )
 
     # ── Model ─────────────────────────────────────────────────────────────
@@ -286,7 +233,6 @@ def main(cfg: dict, checkpoint: str, split_path: str, output_dir: str) -> None:
         print(f"=> Loading checkpoint '{checkpoint}'")
         ckpt_dict = torch.load(checkpoint, map_location="cpu")
         
-        # Load weights, ignore classification heads since we only need embeddings
         model.load_state_dict(ckpt_dict["model"], strict=False)
         print("=> Loaded checkpoint")
     else:
@@ -295,11 +241,11 @@ def main(cfg: dict, checkpoint: str, split_path: str, output_dir: str) -> None:
     model.eval()
 
     # ── Evaluation loop ───────────────────────────────────────────────────
-    global_embeddings_c, global_embeddings_a, global_features = get_embeddings(
+    global_embeddings_c, global_embeddings_a = get_embeddings(
         model, unique_test_loader, device
     )
 
-    auth_metrics = evaluate(model, test_loader, unique_test_dataset, global_embeddings_c, global_embeddings_a, global_features, device)
+    auth_metrics = evaluate(model, test_loader, unique_test_dataset, global_embeddings_c, global_embeddings_a, device)
     
     sim_mat, probe_labels, gallery_labels = evaluate_identification(
         model, identification_loader, device, identification_dataset
